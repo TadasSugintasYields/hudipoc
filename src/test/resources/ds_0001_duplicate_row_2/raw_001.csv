@@ -1,0 +1,2 @@
+id,channel,seller,int_rate,orig_upb,loan_term,start_date,first_pay_date,ltv,cltv,borrow_numb,dti,borrow_credit_score,buyer_indic,purpose,prop_type,nb_units,occ_status,prop_state,zip,insurance_perc,prod_type,coborrow_credit_score,insurance_type,reloc_indic
+100011322040,C,AMTRUSTBANK,10.25,240000,360,12/1999,02/2000,77,,2,19,737,N,P,SF,1,P,MI,483,,FRM,731,,N

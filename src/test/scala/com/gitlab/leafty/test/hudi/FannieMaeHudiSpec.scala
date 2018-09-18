@@ -1,6 +1,8 @@
 package com.gitlab.leafty.test.hudi
 
+import com.github.leafty.hudi.DataSetDef.commonOpts
 import com.github.leafty.hudi._
+import com.uber.hoodie.DataSourceWriteOptions
 
 /**
   *
@@ -16,13 +18,15 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
 
   import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 
-
-  lazy implicit val spark: SparkSession = getSparkSession
+  lazy implicit val spark: SparkSession = SparkBuilder.getSparkSession
   lazy val acquisitionsAll = getAcquisitions_All
   lazy val performancesAll = getPerformances_All
   lazy val performancesAll_counts = List(40, 16, 40, 58, 31, 12, 51, 36)
   lazy val acquisitions_2Split = getAcquisitions_2Split
   lazy val performances_3Split = getPerformances_3Split
+
+  val db = commonOpts(DataSourceWriteOptions.HIVE_DATABASE_OPT_KEY)
+
 
   "test data sets" should {
     "contain acquisitions" in {
@@ -64,16 +68,10 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
     }
   }
 
-  val acquisitionsDs = new AcquisitionsDatasetDef(Some(tmpLocation))
+  val acquisitionsDs = new AcquisitionsDatasetDef(Some(SparkBuilder.tmpLocation))
 
-  val performancesDs = new PerformancesDatasetDef(Some(tmpLocation))
+  val performancesDs = new PerformancesDatasetDef(Some(SparkBuilder.tmpLocation))
 
-  def tmpLocation: String = {
-    import org.junit.rules.TemporaryFolder
-    val folder = new TemporaryFolder()
-    folder.create()
-    folder.getRoot.getAbsolutePath
-  }
 
   def getIds(df: DataFrame, id: String, distinct: Boolean = true): Array[String] = {
     (if (distinct)
@@ -85,8 +83,12 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
 
   import DataSetDef._
 
-
   "hudi" should {
+
+    "clean hive context" in {
+      SparkBuilder.cleardatabase(spark)
+      spark.sqlContext.tables(commonOpts(DataSourceWriteOptions.HIVE_DATABASE_OPT_KEY)).count() shouldBe 0
+    }
 
     import scala.concurrent.Promise
     object CommitRuntime {
@@ -102,7 +104,7 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
 
       CommitRuntime.init
 
-      val df = acquisitions_2Split(0)
+      val df = acquisitions_2Split.head
 
       acquisitionsDs.writeReplace(df)
 
@@ -113,10 +115,18 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
       acquisitionsDs.read().count() shouldBe df.count()
     }
 
+    "hive context should have the acquisitions tables" in {
+      spark.sqlContext.tables(commonOpts(DataSourceWriteOptions.HIVE_DATABASE_OPT_KEY)).head.get(1) shouldBe "acquisitions"
+      spark.sql(s"select * from $db.acquisitions").show()
+      spark.sql(s"select count(*) from $db.acquisitions").head().get(0) shouldBe 4
+
+    }
+
+
     "for (1), ingest their 'performances': first 1/3 rd" in {
 
       // Group 1 from acquisitions, 1st third
-      val acquisitionsDf = acquisitions_2Split(0)
+      val acquisitionsDf = acquisitions_2Split.head
 
       val ids = getIds(acquisitionsDf, "id")
 
@@ -129,7 +139,6 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
         s"""For `acquisitions` ${ids.mkString(", ")}
            ingest `performances` ${getIds(insertDf, performancesDs.ID, false).mkString(", ")}""".stripMargin)
 
-      // insertDf.show()
       performancesDs.writeReplace(insertDf)
 
       CommitRuntime.performancesCommits(0).success(performancesDs.latestCommit)
@@ -137,6 +146,15 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
       performancesDs.listCommitsSince("000").length shouldBe 1
 
       performancesDs.read().count() shouldBe insertDf.count()
+    }
+
+    "hive context should have the performances table" in {
+
+      val df =spark.sqlContext.tables(commonOpts(DataSourceWriteOptions.HIVE_DATABASE_OPT_KEY)).select("tableName")
+      df.filter(df("tableName")==="performances").count() shouldBe 1
+      showPerformances
+      getCountFromPerformances shouldBe 50
+
     }
 
     "for (1), ingest their 'performances': second 1/3 rd" in {
@@ -172,6 +190,30 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
       }
     }
 
+    "hive context should see everything 1st 1/3rd and 2nd 1/3rd and should also see partially " in {
+
+      //performances - table name for which to choose incremental mode
+      setHiveModeToIncremental("performances")
+      //fetch only one commit in incremental mode
+      spark.sql("set hoodie.performances.consume.max.commits=1")
+
+      spark.conf.get("hoodie.performances.consume.mode") shouldBe "INCREMENTAL"
+
+      //each commit until now was 50 each
+      val commits = performancesDs.listCommitsSince("000").zip(List(50,50))
+      val expectedCounts =
+      for{
+        (timestamp,count) <- commits
+      }  yield {
+        spark.sql(s"set hoodie.performances.consume.start.timestamp=${timestamp.toLong-1} ")
+        getCountFromPerformances shouldBe count
+      }
+      // setting mode to LATEST should yield full insert of 100
+      setHiveModeToLatest("performances")
+      getCountFromPerformances shouldBe 100
+
+    }
+
     "for (1), ingest their 'performances': third 1/3 rd" in {
 
       // Group 1 from acquisitions, 3rd third
@@ -204,6 +246,30 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
 
         hudiDf.count() shouldBe insertDf.count()
       }
+
+    }
+
+    "hive context should see everything 1st 1/3rd , 2nd 1/3rd and 3rd 1/3rd" in {
+
+      //performances - table name for which to choose incremental mode
+      setHiveModeToIncremental("performances")
+      //fetch only one commit in incremental mode
+      spark.sql("set hoodie.performances.consume.max.commits=1")
+
+      //each commit until now was 50 each, except the last having 54
+
+      val commits = performancesDs.listCommitsSince("000").zip(List(50,50,54))
+      val expectedCounts =
+        for{
+          (timestamp,count) <- commits
+        }  yield {
+          spark.sql(s"set hoodie.performances.consume.start.timestamp=${timestamp.toLong-1} ")
+          getCountFromPerformances shouldBe count
+        }
+      // setting mode to LATEST should yield full insert of 150
+      setHiveModeToLatest("performances")
+      getCountFromPerformances shouldBe 154
+
     }
 
     "check have ingested first half of ds_0001 x ds_0002 consistently" in {
@@ -242,6 +308,29 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
       acquisitionsDs.listCommitsSince("000").length shouldBe 2
 
       acquisitionsDs.read().count() shouldBe acquisitionsAll.count()
+    }
+
+    "hive context should have both commits of the acquisition table" in {
+
+      //performances - table name for which to choose incremental mode
+      setHiveModeToIncremental("acquisitions")
+      //fetch only one commit in incremental mode
+      spark.sql("set hoodie.acquisitions.consume.max.commits=1")
+
+      //each commit until now was 4 each
+      val commits = performancesDs.listCommitsSince("000").zip(List(4,4))
+      val expectedCounts =
+        for{
+          (timestamp,count) <- commits
+        }  yield {
+          spark.sql(s"set hoodie.acquisitions.consume.start.timestamp=${timestamp.toLong-1} ")
+          spark.sql(s"select count(*) from $db.acquisitions").head().get(0) shouldBe count
+        }
+
+      // setting mode to LATEST should yield full insert of 150
+      setHiveModeToLatest("acquisitions")
+      spark.sql(s"select count(*) from $db.acquisitions").head().get(0) shouldBe 8
+
     }
 
     "for (2), ingest their 'performances': first 1/3 rd" in {
@@ -359,6 +448,21 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
       performancesDf.count() shouldBe performancesAll.count()
     }
 
+    "hive context should have all the rows after all ingestions" in {
+
+      setHiveModeToLatest("performances")
+      getCountFromPerformances shouldBe performancesAll.count()
+      //and all of them should have the foreclosure amount null
+      spark.sql(s"select count(*) from testdb.performances where foreclosure_amount is null ").head().get(0) shouldBe performancesAll.count()
+
+      //and the first 6 commits have all the data
+      setHiveModeToIncremental("performances")
+      spark.sql("set hoodie.performances.consume.max.commits=6")
+      spark.sql(s"set hoodie.performances.consume.start.timestamp=000")
+      getCountFromPerformances shouldBe 284
+
+    }
+
     "force updates to the last 1/3 rd" in  {
       val chunks = getPerformances_3Split_raw
 
@@ -381,6 +485,41 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
 
       df.filter(col("foreclosure_amount").isNotNull).count() shouldBe 98 // #todo df.count() / 3
     }
+
+    "hive context should have updates " in {
+      //after UPSERT we should have 98 with foreclosure_amount not null
+      setHiveModeToLatest("performances")
+      spark.sql(s"select count(*) from $db.performances where foreclosure_amount is NOT null").head().get(0) shouldBe 98
+      //the count should still be performancesAll.count()
+
+      getCountFromPerformances shouldBe performancesAll.count()
+
+      //the first 6 commits are missing the updated entries i.e. - performancesAll.count() - 98
+
+      setHiveModeToIncremental("performances")
+      //fetch only one commit in incremental mode
+      spark.sql("set hoodie.performances.consume.max.commits=6")
+      spark.sql(s"set hoodie.performances.consume.start.timestamp=000")
+      //if we take only the initial 6 commits we should have everything except the last 8 commits done in the upserts above
+      getCountFromPerformances shouldBe (performancesAll.count() -98)
+
+    }
+  }
+
+  private def showPerformances = {
+    spark.sql(s"select * from $db.performances").show()
+  }
+
+  private def getCountFromPerformances = {
+    spark.sql(s"select count(*) from $db.performances").head().get(0)
+  }
+
+  private def setHiveModeToIncremental(table:String) = {
+    spark.sql(s"set hoodie.$table.consume.mode=INCREMENTAL")
+  }
+
+  private def setHiveModeToLatest(table:String) = {
+    spark.sql(s"set hoodie.$table.consume.mode=LATEST")
   }
 
   /**
@@ -440,21 +579,19 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
   }
 
   def getAcquisitions_All: DataFrame = {
-
-    val url = getClass.getResource("/ds_0001")
-
+    //getClass.getResource("/ds_0001") <--switch to this if using local.
+    val url  = "ds_0001"
     import acquisitionsDs.implicits._
 
     spark.read
       .format("csv")
       .option("header", "true")
-      .load(url.getPath)
+      .load(SparkBuilder.hadoopNamenode+url)
       .mapFromRaw
   }
 
   def getPerformances: List[DataFrame] = {
-    val url = getClass.getResource("/ds_0002")
-
+    val url  = "ds_0002"
     /**
       * #resource
       * https://spark.apache.org/docs/2.3.0/api/sql/index.html
@@ -467,7 +604,7 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
         spark.read
         .format("csv")
         .option("header", "true")
-        .load(s"${url.toString}/raw_00$i.csv")
+        .load(s"${SparkBuilder.hadoopNamenode+url}/raw_00$i.csv")
         .mapFromRaw.applyTransformations
     }
   }
@@ -478,15 +615,6 @@ class FannieMaeHudiSpec extends AsyncBaseSpec {
   private def joinAll(dfs: Seq[DataFrame]) = {
     val emptyDF = spark.createDataFrame(spark.sparkContext.emptyRDD[Row], dfs(0).schema)
     dfs.fold(emptyDF) { (df1, df2) ⇒ df1.union(df2) }
-  }
-
-  protected def getSparkSession: SparkSession = {
-    val builder = SparkSession.builder()
-      .appName("test-hudi")
-      .master("local[2]")
-      .config("spark.ui.enabled", "false")
-      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-    builder.getOrCreate()
   }
 
 }

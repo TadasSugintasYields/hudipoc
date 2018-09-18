@@ -33,7 +33,9 @@ abstract case class DatasetDef(name: String, rowKey: String, mergeByKey: String,
   protected def asMap: Map[String, String] = Map(
     HoodieWriteConfig.TABLE_NAME -> name,
     DataSourceWriteOptions.RECORDKEY_FIELD_OPT_KEY -> rowKey,
-    DataSourceWriteOptions.PRECOMBINE_FIELD_OPT_KEY -> mergeByKey
+    DataSourceWriteOptions.PRECOMBINE_FIELD_OPT_KEY -> mergeByKey,
+    DataSourceWriteOptions.HIVE_TABLE_OPT_KEY -> name
+
   )
 
   /**
@@ -125,7 +127,17 @@ object DataSetDef {
   lazy implicit val commonOpts = Map(
     "hoodie.insert.shuffle.parallelism" -> "4",
     "hoodie.upsert.shuffle.parallelism" -> "4",
-    DataSourceWriteOptions.PARTITIONPATH_FIELD_OPT_KEY -> HoodieKeys.PARTITION_KEY
+    DataSourceWriteOptions.PARTITIONPATH_FIELD_OPT_KEY -> HoodieKeys.PARTITION_KEY,
+    //TODO - MOVE HIVE INFORMATION FROM HERE
+    //what is it with the IP - we need to change it .
+    DataSourceWriteOptions.HIVE_DATABASE_OPT_KEY-> "testdb",
+    DataSourceWriteOptions.HIVE_URL_OPT_KEY -> "jdbc:hive2://172.18.0.1:10000",
+    DataSourceWriteOptions.HIVE_PARTITION_FIELDS_OPT_KEY -> "dateStr",
+    DataSourceWriteOptions.HIVE_USER_OPT_KEY-> "hive",
+    DataSourceWriteOptions.HIVE_PASS_OPT_KEY-> "hive",
+    DataSourceWriteOptions.HIVE_SYNC_ENABLED_OPT_KEY-> "true",
+    DataSourceWriteOptions.HIVE_PARTITION_EXTRACTOR_CLASS_OPT_KEY->classOf[SlashToDashPartitionValueExtractor].getCanonicalName
+
   )
 
   def getFs(path: String)(implicit session: SparkSession) = FSUtils.getFs(path, session.sparkContext.hadoopConfiguration)
